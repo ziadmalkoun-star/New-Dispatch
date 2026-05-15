@@ -3296,8 +3296,8 @@ def app():
         eta_discharge = st.number_input("BESS Discharging Efficiency (%)", min_value=1.0, max_value=100.0, value=95.0, step=0.5) / 100.0
         min_soc_pct = st.slider("BESS Minimum SOC (%)", 0, 100, 0)
         max_soc_pct = st.slider("BESS Maximum SOC (%)", 0, 100, 100)
-        initial_soc = st.number_input("BESS BoL SOH (MWh)", min_value=0.0, value=effective_batt_energy_mwh*95%, step=1.0)
-        final_soc = st.number_input("BESS EoL SOH (MWh)", min_value=0.0, value=effective_batt_energy_mwh*60%, step=1.0)
+        initial_soc = st.number_input("BESS BoL SOH (MWh)", min_value=0.0, value=effective_batt_energy_mwh*95/100, step=1.0)
+        final_soc = st.number_input("BESS EoL SOH (MWh)", min_value=0.0, value=effective_batt_energy_mwh*60/100, step=1.0)
         bess_capture_rate_pct = st.number_input("BESS Wholesale Capture Rate (%)", min_value=0.0, max_value=100.0, value=85.0, step=1.0)
         max_cycles_per_year = st.number_input("Max Cycles / year", min_value=0.0, value=547.0, step=0.1)
         cycle_cost = st.number_input("BESS Cycle Cost (EUR/MWh)", value=0.0)
