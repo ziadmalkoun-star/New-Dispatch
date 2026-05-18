@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Dict, Tuple
+from collections import deque
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -80,6 +81,28 @@ class SimulationInputs:
     pv_capture_rate_pct: float = 100.0
     bess_capture_rate_pct: float = 100.0
 
+    # Spain-specific taxes, grid fees and market fees.
+    # Marginal fees are used to build dispatch-effective prices.
+    # Financial-only taxes are kept for reporting and must not affect dispatch.
+    grid_import_fee_eur_per_mwh: float = 0.0
+    grid_export_fee_eur_per_mwh: float = 0.0
+    omie_buy_fee_eur_per_mwh: float = 0.0
+    omie_sell_fee_eur_per_mwh: float = 0.0
+    ree_system_fee_eur_per_mwh: float = 0.0
+    imbalance_cost_pv_eur_per_mwh: float = 0.0
+    imbalance_cost_bess_eur_per_mwh: float = 0.0
+    afrr_capacity_fee_pct: float = 0.0
+    afrr_energy_fee_pct: float = 0.0
+    afrr_energy_fee_eur_per_mwh: float = 0.0
+    ivpee_generation_tax_pct: float = 0.0
+    apply_ivpee_to_pv: bool = True
+    apply_ivpee_to_bess_export: bool = True
+    apply_ivpee_to_afrr_energy: bool = False
+    apply_ivpee_to_afrr_capacity: bool = False
+    corporate_tax_pct: float = 25.0
+    withholding_tax_pct: float = 0.0
+    local_fixed_tax_eur_per_year: float = 0.0
+
     # aFRR inputs
     enable_afrr: bool = False
     afrr_charge_price_qh: np.ndarray | None = None
@@ -142,14 +165,36 @@ def _validate_array_length(arr: np.ndarray, name: str, expected_len: int = QH_PE
 
 
 def rolling_forward_max(values: np.ndarray, horizon_steps: int) -> np.ndarray:
-    """Maximum future value within (t, t + horizon_steps]."""
+    """Maximum future value within (t, t + horizon_steps] in O(n).
+
+    This replaces the previous O(n * horizon) loop with a monotonic deque.
+    It produces the same forward-looking maximum used by the optimizer, but
+    is much faster when the forward horizon is large.
+    """
     values = np.asarray(values, dtype=float).reshape(-1)
-    out = np.full(len(values), -1e30, dtype=float)
+    n = len(values)
+    out = np.full(n, -1e30, dtype=float)
     h = int(max(1, horizon_steps))
-    for t in range(len(values)):
-        end = min(len(values), t + h + 1)
-        if t + 1 < end:
-            out[t] = float(np.nanmax(values[t + 1:end]))
+    cleaned = np.nan_to_num(values, nan=-1e30, posinf=1e30, neginf=-1e30)
+
+    dq: deque[int] = deque()
+    for t in range(n - 1, -1, -1):
+        # Remove indices outside the future window (t, t+h].
+        max_idx = t + h
+        while dq and dq[0] > max_idx:
+            dq.popleft()
+
+        # Add t+1 to the candidate window.
+        add_idx = t + 1
+        if add_idx < n:
+            add_val = cleaned[add_idx]
+            while dq and cleaned[dq[-1]] <= add_val:
+                dq.pop()
+            dq.append(add_idx)
+
+        if dq:
+            out[t] = float(cleaned[dq[0]])
+
     return out
 
 
@@ -196,6 +241,282 @@ def compute_forward_cross_market_value_curves(inputs: SimulationInputs) -> Dict[
         "future_best_market_type": future_type.astype(object),
         "forward_horizon_hours": np.full(QH_PER_YEAR, float(inputs.forward_optimization_horizon_hours), dtype=float),
     }
+
+
+
+def build_effective_dispatch_prices(inputs: SimulationInputs) -> dict:
+    """Build net price arrays for dispatch optimization.
+
+    Only marginal/variable costs are included here. Corporate tax,
+    withholding tax and fixed/local taxes are reporting-only and must not
+    affect dispatch decisions.
+    """
+    pv_price_net = (
+        _validate_array_length(inputs.pv_price, "PV price")
+        - inputs.grid_export_fee_eur_per_mwh
+        - inputs.omie_sell_fee_eur_per_mwh
+        - inputs.ree_system_fee_eur_per_mwh
+        - inputs.imbalance_cost_pv_eur_per_mwh
+    )
+    if inputs.apply_ivpee_to_pv:
+        pv_price_net = pv_price_net * (1.0 - inputs.ivpee_generation_tax_pct / 100.0)
+
+    bess_sell_price_net = (
+        _validate_array_length(inputs.batt_sell_price, "BESS sell price")
+        - inputs.grid_export_fee_eur_per_mwh
+        - inputs.omie_sell_fee_eur_per_mwh
+        - inputs.ree_system_fee_eur_per_mwh
+        - inputs.imbalance_cost_bess_eur_per_mwh
+    )
+    if inputs.apply_ivpee_to_bess_export:
+        bess_sell_price_net = bess_sell_price_net * (1.0 - inputs.ivpee_generation_tax_pct / 100.0)
+
+    grid_buy_price_net = (
+        _validate_array_length(inputs.grid_buy_price, "Grid buy price")
+        + inputs.grid_import_fee_eur_per_mwh
+        + inputs.omie_buy_fee_eur_per_mwh
+        + inputs.ree_system_fee_eur_per_mwh
+        + inputs.imbalance_cost_bess_eur_per_mwh
+    )
+
+    afrr_up_energy_price_net = None
+    if inputs.afrr_discharge_price_qh is not None:
+        afrr_up_energy_price_net = (
+            _validate_array_length(inputs.afrr_discharge_price_qh, "aFRR UP energy price")
+            * (1.0 - inputs.afrr_energy_fee_pct / 100.0)
+            - inputs.afrr_energy_fee_eur_per_mwh
+            - inputs.imbalance_cost_bess_eur_per_mwh
+        )
+        if inputs.apply_ivpee_to_afrr_energy:
+            afrr_up_energy_price_net = afrr_up_energy_price_net * (
+                1.0 - inputs.ivpee_generation_tax_pct / 100.0
+            )
+
+    afrr_down_energy_price_net = None
+    if inputs.afrr_charge_price_qh is not None:
+        # Positive DOWN price = cost to charge. Negative DOWN price = charging benefit.
+        # Variable fees make DOWN charging less attractive.
+        afrr_down_energy_price_net = (
+            _validate_array_length(inputs.afrr_charge_price_qh, "aFRR DOWN energy price")
+            + inputs.afrr_energy_fee_eur_per_mwh
+            + inputs.grid_import_fee_eur_per_mwh
+            + inputs.imbalance_cost_bess_eur_per_mwh
+        )
+
+    afrr_capacity_up_price_net = None
+    if inputs.afrr_capacity_up_price_h is not None:
+        afrr_capacity_up_price_net = (
+            _validate_array_length(inputs.afrr_capacity_up_price_h, "aFRR UP capacity price")
+            * (1.0 - inputs.afrr_capacity_fee_pct / 100.0)
+        )
+        if inputs.apply_ivpee_to_afrr_capacity:
+            afrr_capacity_up_price_net = afrr_capacity_up_price_net * (
+                1.0 - inputs.ivpee_generation_tax_pct / 100.0
+            )
+
+    afrr_capacity_down_price_net = None
+    if inputs.afrr_capacity_down_price_h is not None:
+        afrr_capacity_down_price_net = (
+            _validate_array_length(inputs.afrr_capacity_down_price_h, "aFRR DOWN capacity price")
+            * (1.0 - inputs.afrr_capacity_fee_pct / 100.0)
+        )
+        if inputs.apply_ivpee_to_afrr_capacity:
+            afrr_capacity_down_price_net = afrr_capacity_down_price_net * (
+                1.0 - inputs.ivpee_generation_tax_pct / 100.0
+            )
+
+    return {
+        "pv_price_net": pv_price_net,
+        "bess_sell_price_net": bess_sell_price_net,
+        "grid_buy_price_net": grid_buy_price_net,
+        "afrr_up_energy_price_net": afrr_up_energy_price_net,
+        "afrr_down_energy_price_net": afrr_down_energy_price_net,
+        "afrr_capacity_up_price_net": afrr_capacity_up_price_net,
+        "afrr_capacity_down_price_net": afrr_capacity_down_price_net,
+    }
+
+
+def compute_spain_fee_tax_breakdown(
+    gross_inputs: SimulationInputs,
+    dispatch_inputs: SimulationInputs,
+    result: dict,
+    reconciliation: dict | None,
+    afrr_capacity_result: dict | None,
+    pv_benchmark: dict | None = None,
+) -> dict:
+    """Reporting-only Spain fee/tax breakdown.
+
+    Gross market prices are used to calculate gross revenues. Variable fees and
+    taxes are shown separately. Financial-only taxes are applied after EBITDA and
+    never feed back into dispatch.
+    """
+    rec = reconciliation or {}
+    zeros = np.zeros(QH_PER_YEAR, dtype=float)
+
+    pv_direct_mwh = _validate_array_length(result.get("pv_direct", zeros), "PV direct MWh")
+    pv_revenue_gross = pv_direct_mwh * _validate_array_length(gross_inputs.pv_price, "gross PV price")
+
+    wholesale_discharge_mwh = _validate_array_length(
+        rec.get("wholesale_discharge_qh_mwh", result.get("discharge", zeros)),
+        "wholesale discharge MWh",
+    )
+    wholesale_grid_charge_mwh = _validate_array_length(
+        rec.get("wholesale_grid_charge_qh_mwh", result.get("grid_charge", zeros)),
+        "wholesale grid charge MWh",
+    )
+
+    da_discharge_revenue_gross = wholesale_discharge_mwh * _validate_array_length(gross_inputs.batt_sell_price, "gross DA sell price")
+    da_charge_cost_gross = wholesale_grid_charge_mwh * _validate_array_length(gross_inputs.grid_buy_price, "gross DA buy price")
+
+    afrr_charge_mwh = _validate_array_length(rec.get("afrr_charge_qh_mwh", zeros), "aFRR charge MWh")
+    afrr_discharge_mwh = _validate_array_length(rec.get("afrr_discharge_qh_mwh", zeros), "aFRR discharge MWh")
+
+    if gross_inputs.afrr_charge_price_qh is not None:
+        afrr_charge_cost_gross = afrr_charge_mwh * _validate_array_length(gross_inputs.afrr_charge_price_qh, "gross aFRR DOWN price")
+    else:
+        afrr_charge_cost_gross = zeros.copy()
+
+    if gross_inputs.afrr_discharge_price_qh is not None:
+        afrr_energy_revenue_gross = afrr_discharge_mwh * _validate_array_length(gross_inputs.afrr_discharge_price_qh, "gross aFRR UP price")
+    else:
+        afrr_energy_revenue_gross = zeros.copy()
+
+    afrr_capacity_revenue_gross = zeros.copy()
+    if afrr_capacity_result is not None:
+        # Recompute expected gross capacity revenue from gross prices so capacity
+        # fees/IVPEE can be shown separately and not double-counted.
+        success = min(max(float(gross_inputs.afrr_capacity_success_rate_pct) / 100.0, 0.0), 1.0)
+        up_awarded = np.asarray(afrr_capacity_result.get("afrr_capacity_up_awarded_h", zeros), dtype=float).reshape(-1)
+        down_awarded = np.asarray(afrr_capacity_result.get("afrr_capacity_down_awarded_h", zeros), dtype=float).reshape(-1)
+        if len(up_awarded) != QH_PER_YEAR:
+            up_awarded = zeros.copy()
+        if len(down_awarded) != QH_PER_YEAR:
+            down_awarded = zeros.copy()
+
+        if gross_inputs.afrr_capacity_up_price_h is not None:
+            afrr_capacity_revenue_gross += (
+                up_awarded
+                * _validate_array_length(gross_inputs.afrr_capacity_up_price_h, "gross aFRR UP capacity price")
+                * float(gross_inputs.afrr_certified_capacity_up_mw)
+                * QH_DT_HOURS
+                * success
+            )
+        if gross_inputs.afrr_capacity_down_price_h is not None:
+            afrr_capacity_revenue_gross += (
+                down_awarded
+                * _validate_array_length(gross_inputs.afrr_capacity_down_price_h, "gross aFRR DOWN capacity price")
+                * float(gross_inputs.afrr_certified_capacity_down_mw)
+                * QH_DT_HOURS
+                * success
+            )
+
+    pv_export_fee = pv_direct_mwh * gross_inputs.grid_export_fee_eur_per_mwh
+    pv_omie_fee = pv_direct_mwh * gross_inputs.omie_sell_fee_eur_per_mwh
+    pv_ree_fee = pv_direct_mwh * gross_inputs.ree_system_fee_eur_per_mwh
+    pv_imbalance_cost = pv_direct_mwh * gross_inputs.imbalance_cost_pv_eur_per_mwh
+
+    da_grid_import_fee = wholesale_grid_charge_mwh * gross_inputs.grid_import_fee_eur_per_mwh
+    da_buy_omie_fee = wholesale_grid_charge_mwh * gross_inputs.omie_buy_fee_eur_per_mwh
+    da_buy_ree_fee = wholesale_grid_charge_mwh * gross_inputs.ree_system_fee_eur_per_mwh
+    da_buy_imbalance_cost = wholesale_grid_charge_mwh * gross_inputs.imbalance_cost_bess_eur_per_mwh
+
+    da_export_fee = wholesale_discharge_mwh * gross_inputs.grid_export_fee_eur_per_mwh
+    da_sell_omie_fee = wholesale_discharge_mwh * gross_inputs.omie_sell_fee_eur_per_mwh
+    da_sell_ree_fee = wholesale_discharge_mwh * gross_inputs.ree_system_fee_eur_per_mwh
+    da_sell_imbalance_cost = wholesale_discharge_mwh * gross_inputs.imbalance_cost_bess_eur_per_mwh
+
+    afrr_energy_fee_pct_cost = np.maximum(afrr_energy_revenue_gross, 0.0) * (gross_inputs.afrr_energy_fee_pct / 100.0)
+    afrr_energy_fee_variable = (np.abs(afrr_charge_mwh) + np.abs(afrr_discharge_mwh)) * gross_inputs.afrr_energy_fee_eur_per_mwh
+    afrr_capacity_fee = np.maximum(afrr_capacity_revenue_gross, 0.0) * (gross_inputs.afrr_capacity_fee_pct / 100.0)
+
+    ivpee_rate = gross_inputs.ivpee_generation_tax_pct / 100.0
+    pv_ivpee_tax = np.maximum(pv_revenue_gross, 0.0) * ivpee_rate if gross_inputs.apply_ivpee_to_pv else zeros.copy()
+    da_ivpee_tax = np.maximum(da_discharge_revenue_gross, 0.0) * ivpee_rate if gross_inputs.apply_ivpee_to_bess_export else zeros.copy()
+    afrr_energy_ivpee_tax = np.maximum(afrr_energy_revenue_gross, 0.0) * ivpee_rate if gross_inputs.apply_ivpee_to_afrr_energy else zeros.copy()
+    afrr_capacity_ivpee_tax = np.maximum(afrr_capacity_revenue_gross, 0.0) * ivpee_rate if gross_inputs.apply_ivpee_to_afrr_capacity else zeros.copy()
+
+    total_variable_fees_and_taxes = (
+        pv_export_fee + pv_omie_fee + pv_ree_fee + pv_imbalance_cost + pv_ivpee_tax
+        + da_grid_import_fee + da_buy_omie_fee + da_buy_ree_fee + da_buy_imbalance_cost
+        + da_export_fee + da_sell_omie_fee + da_sell_ree_fee + da_sell_imbalance_cost
+        + afrr_energy_fee_pct_cost + afrr_energy_fee_variable + afrr_capacity_fee
+        + da_ivpee_tax + afrr_energy_ivpee_tax + afrr_capacity_ivpee_tax
+    )
+
+    gross_revenue_before_fees = (
+        pv_revenue_gross
+        + da_discharge_revenue_gross
+        - da_charge_cost_gross
+        + afrr_energy_revenue_gross
+        - afrr_charge_cost_gross
+        + afrr_capacity_revenue_gross
+    )
+    net_revenue_after_variable_fees = gross_revenue_before_fees - total_variable_fees_and_taxes
+
+    ebitda_before_fixed_costs = float(np.sum(net_revenue_after_variable_fees))
+    ebitda_after_fixed_costs = ebitda_before_fixed_costs - float(gross_inputs.local_fixed_tax_eur_per_year)
+    taxable_profit = max(ebitda_after_fixed_costs, 0.0)
+    corporate_tax = taxable_profit * gross_inputs.corporate_tax_pct / 100.0
+    cash_flow_after_corporate_tax = ebitda_after_fixed_costs - corporate_tax
+    withholding_tax = max(cash_flow_after_corporate_tax, 0.0) * gross_inputs.withholding_tax_pct / 100.0
+    cash_flow_after_tax_and_withholding = cash_flow_after_corporate_tax - withholding_tax
+
+    return {
+        "pv_revenue_gross_eur": pv_revenue_gross,
+        "da_discharge_revenue_gross_eur": da_discharge_revenue_gross,
+        "da_charge_cost_gross_eur": da_charge_cost_gross,
+        "afrr_energy_revenue_gross_eur": afrr_energy_revenue_gross,
+        "afrr_charge_cost_gross_eur": afrr_charge_cost_gross,
+        "afrr_capacity_revenue_gross_eur": afrr_capacity_revenue_gross,
+        "pv_export_fee_eur": pv_export_fee,
+        "pv_omie_fee_eur": pv_omie_fee,
+        "pv_ree_fee_eur": pv_ree_fee,
+        "pv_imbalance_cost_eur": pv_imbalance_cost,
+        "pv_ivpee_tax_eur": pv_ivpee_tax,
+        "da_grid_import_fee_eur": da_grid_import_fee,
+        "da_buy_omie_fee_eur": da_buy_omie_fee,
+        "da_buy_ree_fee_eur": da_buy_ree_fee,
+        "da_buy_imbalance_cost_eur": da_buy_imbalance_cost,
+        "da_export_fee_eur": da_export_fee,
+        "da_sell_omie_fee_eur": da_sell_omie_fee,
+        "da_sell_ree_fee_eur": da_sell_ree_fee,
+        "da_sell_imbalance_cost_eur": da_sell_imbalance_cost,
+        "da_ivpee_tax_eur": da_ivpee_tax,
+        "afrr_energy_fee_pct_cost_eur": afrr_energy_fee_pct_cost,
+        "afrr_energy_fee_variable_eur": afrr_energy_fee_variable,
+        "afrr_capacity_fee_eur": afrr_capacity_fee,
+        "afrr_energy_ivpee_tax_eur": afrr_energy_ivpee_tax,
+        "afrr_capacity_ivpee_tax_eur": afrr_capacity_ivpee_tax,
+        "total_variable_fees_and_taxes_eur": total_variable_fees_and_taxes,
+        "gross_revenue_before_fees_eur": gross_revenue_before_fees,
+        "net_revenue_after_variable_fees_eur": net_revenue_after_variable_fees,
+        "ebitda_before_fixed_costs_eur": np.array([ebitda_before_fixed_costs]),
+        "local_fixed_tax_eur_per_year": np.array([float(gross_inputs.local_fixed_tax_eur_per_year)]),
+        "ebitda_after_fixed_costs_eur": np.array([ebitda_after_fixed_costs]),
+        "corporate_tax_eur": np.array([corporate_tax]),
+        "withholding_tax_eur": np.array([withholding_tax]),
+        "cash_flow_after_tax_and_withholding_eur": np.array([cash_flow_after_tax_and_withholding]),
+    }
+
+
+def summarize_spain_fee_tax_breakdown(fee_breakdown: dict) -> pd.DataFrame:
+    """One-row-per-metric summary for Streamlit and Excel."""
+    def total(key: str) -> float:
+        value = fee_breakdown.get(key, np.array([0.0]))
+        return float(np.nansum(np.asarray(value, dtype=float)))
+
+    rows = [
+        ("Gross revenue before fees", total("gross_revenue_before_fees_eur")),
+        ("Total variable fees and taxes", total("total_variable_fees_and_taxes_eur")),
+        ("Net revenue after variable fees", total("net_revenue_after_variable_fees_eur")),
+        ("Local/fixed taxes", total("local_fixed_tax_eur_per_year")),
+        ("EBITDA after fixed costs", total("ebitda_after_fixed_costs_eur")),
+        ("Corporate tax", total("corporate_tax_eur")),
+        ("Withholding tax", total("withholding_tax_eur")),
+        ("Cash flow after tax and withholding", total("cash_flow_after_tax_and_withholding_eur")),
+    ]
+    return pd.DataFrame([(name, value, "€") for name, value in rows], columns=["Indicateur", "Valeur", "Unité"])
+
 
 
 
@@ -454,6 +775,7 @@ def _make_flat_curve(value: float, expected_len: int = QH_PER_YEAR) -> np.ndarra
     return np.full(expected_len, float(value), dtype=float)
 
 
+@st.cache_data(show_spinner=False)
 def build_quarter_hour_index(year: int = DEFAULT_YEAR) -> pd.DatetimeIndex:
     return pd.date_range(f"{year}-01-01 00:00:00", periods=QH_PER_YEAR, freq="15min")
 
@@ -961,6 +1283,7 @@ def simulate_afrr_capacity(
         "afrr_down_rejected_due_to_final_combined_soc": np.zeros(QH_PER_YEAR, dtype=int),
     }
 
+@st.cache_data(show_spinner=False)
 def build_standard_france_solar_profile() -> np.ndarray:
     idx = build_quarter_hour_index(DEFAULT_YEAR)
     doy = idx.dayofyear.to_numpy()
@@ -3225,10 +3548,29 @@ def build_inputs_dataframe(inputs: SimulationInputs) -> pd.DataFrame:
         ("bess_degradation_curve_pct", "" if inputs.bess_degradation_curve_pct is None else list(inputs.bess_degradation_curve_pct)),
         ("degraded_bess_energy_by_year_mwh", "" if inputs.degraded_bess_energy_by_year_mwh is None else list(inputs.degraded_bess_energy_by_year_mwh)),
         ("project_lifetime_years", inputs.project_lifetime_years),
+        ("grid_import_fee_eur_per_mwh", inputs.grid_import_fee_eur_per_mwh),
+        ("grid_export_fee_eur_per_mwh", inputs.grid_export_fee_eur_per_mwh),
+        ("omie_buy_fee_eur_per_mwh", inputs.omie_buy_fee_eur_per_mwh),
+        ("omie_sell_fee_eur_per_mwh", inputs.omie_sell_fee_eur_per_mwh),
+        ("ree_system_fee_eur_per_mwh", inputs.ree_system_fee_eur_per_mwh),
+        ("imbalance_cost_pv_eur_per_mwh", inputs.imbalance_cost_pv_eur_per_mwh),
+        ("imbalance_cost_bess_eur_per_mwh", inputs.imbalance_cost_bess_eur_per_mwh),
+        ("afrr_capacity_fee_pct", inputs.afrr_capacity_fee_pct),
+        ("afrr_energy_fee_pct", inputs.afrr_energy_fee_pct),
+        ("afrr_energy_fee_eur_per_mwh", inputs.afrr_energy_fee_eur_per_mwh),
+        ("ivpee_generation_tax_pct", inputs.ivpee_generation_tax_pct),
+        ("apply_ivpee_to_pv", inputs.apply_ivpee_to_pv),
+        ("apply_ivpee_to_bess_export", inputs.apply_ivpee_to_bess_export),
+        ("apply_ivpee_to_afrr_energy", inputs.apply_ivpee_to_afrr_energy),
+        ("apply_ivpee_to_afrr_capacity", inputs.apply_ivpee_to_afrr_capacity),
+        ("corporate_tax_pct", inputs.corporate_tax_pct),
+        ("withholding_tax_pct", inputs.withholding_tax_pct),
+        ("local_fixed_tax_eur_per_year", inputs.local_fixed_tax_eur_per_year),
     ]
     return pd.DataFrame(rows, columns=["Parameter", "Value"])
 
 
+@st.cache_data(show_spinner=False)
 def to_excel_bytes(
     inputs_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -3238,25 +3580,45 @@ def to_excel_bytes(
     afrr_daily_log_df: pd.DataFrame | None = None,
     afrr_capacity_df: pd.DataFrame | None = None,
     bess_degradation_df: pd.DataFrame | None = None,
+    spain_fee_tax_df: pd.DataFrame | None = None,
+    spain_fee_tax_summary_df: pd.DataFrame | None = None,
 ) -> bytes:
+    def _write_excel(output_buffer: io.BytesIO, engine: str, engine_kwargs: dict | None = None) -> None:
+        writer_kwargs = {"engine": engine}
+        if engine_kwargs is not None:
+            writer_kwargs["engine_kwargs"] = engine_kwargs
+        with pd.ExcelWriter(output_buffer, **writer_kwargs) as writer:
+            inputs_df.to_excel(writer, sheet_name="Inputs", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            monthly_df.to_excel(writer, sheet_name="Monthly", index=False)
+            hourly_df.to_excel(writer, sheet_name="Hourly", index=False)
+
+            if afrr_qh_df is not None:
+                afrr_qh_df.to_excel(writer, sheet_name="aFRR_QH", index=False)
+
+            if afrr_daily_log_df is not None:
+                afrr_daily_log_df.to_excel(writer, sheet_name="aFRR_Daily_Log", index=False)
+
+            if afrr_capacity_df is not None:
+                afrr_capacity_df.to_excel(writer, sheet_name="aFRR_Capacity", index=False)
+
+            if bess_degradation_df is not None:
+                bess_degradation_df.to_excel(writer, sheet_name="BESS_Degradation", index=False)
+
+            if spain_fee_tax_df is not None:
+                spain_fee_tax_df.to_excel(writer, sheet_name="Spain Fees and Taxes", index=False)
+
+            if spain_fee_tax_summary_df is not None:
+                spain_fee_tax_summary_df.to_excel(writer, sheet_name="Spain Fees Summary", index=False)
+
+    # xlsxwriter is usually faster and more memory-efficient for large exports.
+    # Fall back to openpyxl if xlsxwriter is unavailable in the Streamlit environment.
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        inputs_df.to_excel(writer, sheet_name="Inputs", index=False)
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        monthly_df.to_excel(writer, sheet_name="Monthly", index=False)
-        hourly_df.to_excel(writer, sheet_name="Hourly", index=False)
-
-        if afrr_qh_df is not None:
-            afrr_qh_df.to_excel(writer, sheet_name="aFRR_QH", index=False)
-
-        if afrr_daily_log_df is not None:
-            afrr_daily_log_df.to_excel(writer, sheet_name="aFRR_Daily_Log", index=False)
-
-        if afrr_capacity_df is not None:
-            afrr_capacity_df.to_excel(writer, sheet_name="aFRR_Capacity", index=False)
-
-        if bess_degradation_df is not None:
-            bess_degradation_df.to_excel(writer, sheet_name="BESS_Degradation", index=False)
+    try:
+        _write_excel(output, engine="xlsxwriter", engine_kwargs={"options": {"constant_memory": True}})
+    except Exception:
+        output = io.BytesIO()
+        _write_excel(output, engine="openpyxl", engine_kwargs=None)
 
     return output.getvalue()
 
@@ -3532,10 +3894,38 @@ def app():
 
         with c_afrr3:
             st.info("Phase 1: aFRR Energy is eligible at any 15-minute timestep. Night filters were removed.")
-            forward_optimization_horizon_hours = st.slider("Forward Optimization Horizon (hours)", min_value=1, max_value=72, value=24, step=1)
-            afrr_up_cross_market_min_spread = st.number_input("Minimum Spread Wholesale Charge → aFRR UP Discharge (€/MWh)", min_value=0.0, value=20.0, step=1.0)
-            afrr_down_to_wholesale_min_spread = st.number_input("Minimum Spread aFRR DOWN Charge → Wholesale Discharge (€/MWh)", min_value=0.0, value=20.0, step=1.0)
+            forward_optimization_horizon_hours = st.slider("Forward Optimization Horizon (hours)", min_value=1, max_value=72, value=72, step=1)
+            afrr_up_cross_market_min_spread = st.number_input("Minimum Spread Wholesale Charge → aFRR UP Discharge (€/MWh)", min_value=0.0, value=min_spread_arbitrage, step=1.0)
+            afrr_down_to_wholesale_min_spread = st.number_input("Minimum Spread aFRR DOWN Charge → Wholesale Discharge (€/MWh)", min_value=0.0, value=min_spread_arbitrage, step=1.0)
             afrr_max_events_per_day = st.number_input("Nombre max d'événements aFRR / jour (legacy, not used in Phase 1 capacity mode)", min_value=1, value=1, step=1)
+
+    with st.expander("Spain taxes, grid fees and market fees", expanded=False):
+        st.caption(
+            "Marginal/variable fees are included in dispatch-effective prices. "
+            "Corporate tax, withholding tax and local/fixed taxes are reporting-only."
+        )
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            grid_import_fee_eur_per_mwh = st.number_input("Grid import fee for BESS charging (€/MWh)", min_value=0.0, value=0.0, step=0.1)
+            grid_export_fee_eur_per_mwh = st.number_input("Grid export fee (€/MWh)", min_value=0.0, value=0.0, step=0.1)
+            omie_buy_fee_eur_per_mwh = st.number_input("OMIE / market fee on DA purchases (€/MWh)", min_value=0.0, value=0.0, step=0.01)
+            omie_sell_fee_eur_per_mwh = st.number_input("OMIE / market fee on DA sales (€/MWh)", min_value=0.0, value=0.0, step=0.01)
+            ree_system_fee_eur_per_mwh = st.number_input("REE / system operator variable fee (€/MWh)", min_value=0.0, value=0.0, step=0.01)
+        with f2:
+            imbalance_cost_pv_eur_per_mwh = st.number_input("PV imbalance / deviation cost (€/MWh)", min_value=0.0, value=0.0, step=0.1)
+            imbalance_cost_bess_eur_per_mwh = st.number_input("BESS imbalance / deviation cost (€/MWh)", min_value=0.0, value=0.0, step=0.1)
+            afrr_capacity_fee_pct = st.number_input("aFRR capacity fee (% of capacity revenue)", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+            afrr_energy_fee_pct = st.number_input("aFRR energy fee (% of energy revenue)", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+            afrr_energy_fee_eur_per_mwh = st.number_input("aFRR energy variable fee (€/MWh)", min_value=0.0, value=0.0, step=0.1)
+        with f3:
+            ivpee_generation_tax_pct = st.number_input("IVPEE / electricity generation tax (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+            apply_ivpee_to_pv = st.checkbox("Apply IVPEE to PV revenue", value=True)
+            apply_ivpee_to_bess_export = st.checkbox("Apply IVPEE to BESS DA export revenue", value=True)
+            apply_ivpee_to_afrr_energy = st.checkbox("Apply IVPEE to aFRR energy revenue", value=False)
+            apply_ivpee_to_afrr_capacity = st.checkbox("Apply IVPEE to aFRR capacity revenue", value=False)
+            corporate_tax_pct = st.number_input("Corporate income tax (%) - financial model only", min_value=0.0, max_value=100.0, value=25.0, step=0.1)
+            withholding_tax_pct = st.number_input("Withholding tax (%) - financial model only", min_value=0.0, max_value=100.0, value=0.0, step=0.1)
+            local_fixed_tax_eur_per_year = st.number_input("Local / fixed taxes (€/year)", min_value=0.0, value=0.0, step=1000.0)
 
     st.markdown("---")
     run = st.button("Lancer la simulation", type="primary")
@@ -3841,6 +4231,24 @@ def app():
             afrr_down_to_wholesale_min_spread_eur_per_mwh=float(afrr_down_to_wholesale_min_spread),
             pv_capture_rate_pct=pv_capture_rate_pct,
             bess_capture_rate_pct=bess_capture_rate_pct,
+            grid_import_fee_eur_per_mwh=grid_import_fee_eur_per_mwh,
+            grid_export_fee_eur_per_mwh=grid_export_fee_eur_per_mwh,
+            omie_buy_fee_eur_per_mwh=omie_buy_fee_eur_per_mwh,
+            omie_sell_fee_eur_per_mwh=omie_sell_fee_eur_per_mwh,
+            ree_system_fee_eur_per_mwh=ree_system_fee_eur_per_mwh,
+            imbalance_cost_pv_eur_per_mwh=imbalance_cost_pv_eur_per_mwh,
+            imbalance_cost_bess_eur_per_mwh=imbalance_cost_bess_eur_per_mwh,
+            afrr_capacity_fee_pct=afrr_capacity_fee_pct,
+            afrr_energy_fee_pct=afrr_energy_fee_pct,
+            afrr_energy_fee_eur_per_mwh=afrr_energy_fee_eur_per_mwh,
+            ivpee_generation_tax_pct=ivpee_generation_tax_pct,
+            apply_ivpee_to_pv=apply_ivpee_to_pv,
+            apply_ivpee_to_bess_export=apply_ivpee_to_bess_export,
+            apply_ivpee_to_afrr_energy=apply_ivpee_to_afrr_energy,
+            apply_ivpee_to_afrr_capacity=apply_ivpee_to_afrr_capacity,
+            corporate_tax_pct=corporate_tax_pct,
+            withholding_tax_pct=withholding_tax_pct,
+            local_fixed_tax_eur_per_year=local_fixed_tax_eur_per_year,
             enable_afrr=enable_afrr,
             afrr_charge_price_qh=afrr_charge_curve_qh_effective,
             afrr_discharge_price_qh=afrr_discharge_curve_qh_effective,
@@ -3882,11 +4290,28 @@ def app():
             degraded_bess_energy_by_year_mwh=degraded_bess_energy_by_year_mwh,
         )
 
+        # Keep a gross input object for reporting, then create a dispatch-only
+        # copy using net effective prices. This avoids double-counting fees:
+        # dispatch sees net prices, reporting still shows gross revenues and
+        # variable fees/taxes separately.
+        gross_inputs = sim_inputs
+        effective_prices = build_effective_dispatch_prices(gross_inputs)
+        sim_inputs = replace(
+            gross_inputs,
+            pv_price=effective_prices["pv_price_net"],
+            batt_sell_price=effective_prices["bess_sell_price_net"],
+            grid_buy_price=effective_prices["grid_buy_price_net"],
+            afrr_discharge_price_qh=effective_prices["afrr_up_energy_price_net"],
+            afrr_charge_price_qh=effective_prices["afrr_down_energy_price_net"],
+            afrr_capacity_up_price_h=effective_prices["afrr_capacity_up_price_net"],
+            afrr_capacity_down_price_h=effective_prices["afrr_capacity_down_price_net"],
+        )
+
         # Phase 1 co-optimization flow:
         # 1) run a baseline wholesale DP without aFRR capacity blocking,
         # 2) select aFRR capacity by expected-value comparison against that wholesale reference,
         # 3) rerun the final DP with selected aFRR capacity intervals blocked from wholesale dispatch.
-        inputs_df = build_inputs_dataframe(sim_inputs)
+        inputs_df = build_inputs_dataframe(gross_inputs)
 
         with st.spinner("Optimisation wholesale de référence en cours..."):
             wholesale_reference_result = optimize_dispatch_dp(sim_inputs)
@@ -4139,6 +4564,26 @@ def app():
             })
             combined_soc_hourly_end = combined_soc_result["combined_soc_hourly_end"]
 
+        spain_fee_tax_breakdown = compute_spain_fee_tax_breakdown(
+            gross_inputs=gross_inputs,
+            dispatch_inputs=sim_inputs,
+            result=final_result,
+            reconciliation=reconciliation,
+            afrr_capacity_result=afrr_capacity_result,
+            pv_benchmark=pure_pv_benchmark,
+        )
+        spain_fee_tax_df = _make_qh_dataframe(spain_fee_tax_breakdown)
+        spain_fee_tax_summary_df = summarize_spain_fee_tax_breakdown(spain_fee_tax_breakdown)
+
+        # Expose Spain fee/tax totals in final_result for graphs and KPI reporting.
+        final_result["gross_revenue_before_fees_eur"] = np.array([float(np.sum(spain_fee_tax_breakdown["gross_revenue_before_fees_eur"]))])
+        final_result["total_variable_fees_and_taxes_eur"] = np.array([float(np.sum(spain_fee_tax_breakdown["total_variable_fees_and_taxes_eur"]))])
+        final_result["net_revenue_after_variable_fees_eur"] = np.array([float(np.sum(spain_fee_tax_breakdown["net_revenue_after_variable_fees_eur"]))])
+        final_result["ebitda_after_fixed_costs_eur"] = spain_fee_tax_breakdown["ebitda_after_fixed_costs_eur"]
+        final_result["corporate_tax_eur"] = spain_fee_tax_breakdown["corporate_tax_eur"]
+        final_result["withholding_tax_eur"] = spain_fee_tax_breakdown["withholding_tax_eur"]
+        final_result["cash_flow_after_tax_and_withholding_eur"] = spain_fee_tax_breakdown["cash_flow_after_tax_and_withholding_eur"]
+
         summary_df = build_summary_table(
             final_result,
             pv_stats,
@@ -4149,6 +4594,7 @@ def app():
             bess_capture_rate_pct,
             curtailment_outputs,
         )
+        summary_df = pd.concat([summary_df, spain_fee_tax_summary_df], ignore_index=True)
 
         monthly_df = monthly_dataframe(final_result, pure_pv_benchmark, pv_dc_mw, batt_power_mw, curtailment_outputs)
         
@@ -4437,7 +4883,7 @@ def app():
             "afrr_down_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
         })
 
-        inputs_df = build_inputs_dataframe(sim_inputs)
+        inputs_df = build_inputs_dataframe(gross_inputs)
         excel_bytes = to_excel_bytes(
             inputs_df=inputs_df,
             summary_df=summary_df,
@@ -4447,6 +4893,8 @@ def app():
             afrr_daily_log_df=afrr_result["afrr_daily_log"] if afrr_result is not None else None,
             afrr_capacity_df=afrr_capacity_df if enable_afrr_capacity else None,
             bess_degradation_df=bess_degradation_df,
+            spain_fee_tax_df=spain_fee_tax_df,
+            spain_fee_tax_summary_df=spain_fee_tax_summary_df,
         )
 
         end_time = time.time()
@@ -4482,6 +4930,19 @@ def app():
         b1.metric("Nominal BESS Energy Capacity", f"{batt_energy_mwh:,.2f} MWh")
         b2.metric("BESS Availability", f"{bess_availability_pct:,.1f} %")
         b3.metric("Effective BESS Energy Capacity", f"{effective_batt_energy_mwh:,.2f} MWh")
+
+        st.subheader("Spain fees, taxes and net revenue")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Gross revenue before fees", f"{float(final_result['gross_revenue_before_fees_eur'][0]):,.0f} EUR")
+        s2.metric("Variable fees & taxes", f"{float(final_result['total_variable_fees_and_taxes_eur'][0]):,.0f} EUR")
+        s3.metric("Net after variable fees", f"{float(final_result['net_revenue_after_variable_fees_eur'][0]):,.0f} EUR")
+        s4.metric("Cash flow after tax", f"{float(final_result['cash_flow_after_tax_and_withholding_eur'][0]):,.0f} EUR")
+        s5, s6, s7, s8, s9 = st.columns(5)
+        s5.metric("Effective PV capture", f"{float(np.average(sim_inputs.pv_price, weights=np.maximum(final_result['pv_direct'], 0))) if np.sum(final_result['pv_direct']) > 1e-9 else 0.0:,.2f} €/MWh")
+        s6.metric("Effective DA discharge", f"{float(np.average(sim_inputs.batt_sell_price, weights=np.maximum(final_result['discharge'], 0))) if np.sum(final_result['discharge']) > 1e-9 else 0.0:,.2f} €/MWh")
+        s7.metric("Effective DA charging", f"{float(np.average(sim_inputs.grid_buy_price, weights=np.maximum(final_result['grid_charge'], 0))) if np.sum(final_result['grid_charge']) > 1e-9 else 0.0:,.2f} €/MWh")
+        s8.metric("Effective aFRR UP energy", f"{float(np.average(sim_inputs.afrr_discharge_price_qh, weights=np.maximum(reconciliation['afrr_discharge_qh_mwh'], 0))) if (reconciliation is not None and sim_inputs.afrr_discharge_price_qh is not None and np.sum(reconciliation['afrr_discharge_qh_mwh']) > 1e-9) else 0.0:,.2f} €/MWh")
+        s9.metric("Effective aFRR DOWN charging", f"{float(np.average(sim_inputs.afrr_charge_price_qh, weights=np.maximum(reconciliation['afrr_charge_qh_mwh'], 0))) if (reconciliation is not None and sim_inputs.afrr_charge_price_qh is not None and np.sum(reconciliation['afrr_charge_qh_mwh']) > 1e-9) else 0.0:,.2f} €/MWh")
 
         st.subheader("Synthèse")
         summary_display_df = format_synthese_table_for_display(summary_df)
@@ -4638,39 +5099,52 @@ def app():
         c1, c2 = st.columns(2)
 
         with c1:
-            fig1, ax1 = plt.subplots(figsize=(8, 4.5))
+            fig1, ax1 = plt.subplots(figsize=(10, 4.8))
+
+            fee_total = float(np.sum(spain_fee_tax_breakdown["total_variable_fees_and_taxes_eur"]))
             bars = [
-                float(final_result["total_direct_pv_revenue"][0]) / 1e6,
-                float(final_result["total_batt_sale_revenue"][0]) / 1e6,
-                -float(final_result["total_grid_charge_cost"][0]) / 1e6,
-                float(final_result["nightly_revenue_total"][0]) / 1e6,
-                float(final_result["total_afrr_net_revenue_eur"][0]) / 1e6 if "total_afrr_net_revenue_eur" in final_result else 0.0,
-                float(final_result["total_afrr_capacity_revenue_eur"][0]) / 1e6 if "total_afrr_capacity_revenue_eur" in final_result else 0.0,
+                float(np.sum(spain_fee_tax_breakdown["pv_revenue_gross_eur"])) / 1e6,
+                float(np.sum(spain_fee_tax_breakdown["da_discharge_revenue_gross_eur"])) / 1e6,
+                -float(np.sum(spain_fee_tax_breakdown["da_charge_cost_gross_eur"])) / 1e6,
+                float(np.sum(spain_fee_tax_breakdown["afrr_energy_revenue_gross_eur"])) / 1e6,
+                -float(np.sum(spain_fee_tax_breakdown["afrr_charge_cost_gross_eur"])) / 1e6,
+                float(np.sum(spain_fee_tax_breakdown["afrr_capacity_revenue_gross_eur"])) / 1e6,
+                -fee_total / 1e6,
+                float(np.sum(spain_fee_tax_breakdown["net_revenue_after_variable_fees_eur"])) / 1e6,
                 float(pure_pv_benchmark["total_pv_only_revenue_eur"][0]) / 1e6,
             ]
-        
+
             labels = [
-                "PV direct",
-                "BESS Wholesale",
-                "BESS Charging Cost",
-                "SS nuit",
-                "BESS aFRR Energy",
-                "BESS aFRR Capacity",
+                "PV direct gross",
+                "DA gross",
+                "DA Charge Cost",
+                "aFRR Energy gross",
+                "aFRR Charge Cost",
+                "aFRR Capacity gross",
+                "Variable fees & taxes",
+                "Net after variable fees",
                 "PV-only",
             ]
-        
-            ax1.bar(labels, bars)
-        
-            # Thin horizontal zero line
+            colors = [
+                "orange",
+                "tab:blue",
+                "tab:red",
+                "tab:cyan",
+                "tab:red",
+                "tab:purple",
+                "tab:brown",
+                "tab:green",
+                "orange",
+            ]
+
+            ax1.bar(labels, bars, color=colors)
             ax1.axhline(0, linewidth=0.8, color="black")
-        
-            # Remove scientific notation / 1e6 offset on y-axis
             ax1.ticklabel_format(axis="y", style="plain", useOffset=False)
-        
             ax1.set_title("Revenue Breakdown")
             ax1.set_ylabel("million €")
-            ax1.tick_params(axis="x", rotation=20)
-        
+            ax1.tick_params(axis="x", rotation=30)
+            fig1.tight_layout()
+
             st.pyplot(fig1)
             plt.close(fig1)
 
@@ -4678,27 +5152,28 @@ def app():
             fig2, ax2 = plt.subplots(figsize=(9, 4.8))
 
             x = np.arange(len(monthly_df))
+            pv_vals = monthly_df["pv_revenue_keur_per_mw"].to_numpy(dtype=float)
             afrr_vals = monthly_df["afrr_net_revenue"].to_numpy(dtype=float) / max(batt_power_mw, 1e-12) / 1000.0
             afrr_capacity_vals = monthly_df["afrr_capacity_total_revenue"].to_numpy(dtype=float) / max(batt_power_mw, 1e-12) / 1000.0 if "afrr_capacity_total_revenue" in monthly_df.columns else np.zeros(len(monthly_df))
             bess_vals = monthly_df["bess_revenue_keur_per_mw"].to_numpy(dtype=float) - afrr_vals - afrr_capacity_vals
 
-            ax2.bar(x, bess_vals, width=0.65, color="lightgreen", label="DA Arbitrage")
-            ax2.bar(x, afrr_capacity_vals, width=0.65, bottom=bess_vals, label="aFRR Capacity")
-            ax2.bar(x, afrr_vals, width=0.65, bottom=bess_vals + afrr_capacity_vals, color="blue", label="aFRR Energy")
+            ax2.bar(x, pv_vals, width=0.65, color="orange", label="PV")
+            ax2.bar(x, bess_vals, width=0.65, bottom=pv_vals, color="lightgreen", label="DA Arbitrage")
+            ax2.bar(x, afrr_capacity_vals, width=0.65, bottom=pv_vals + bess_vals, label="aFRR Capacity")
+            ax2.bar(x, afrr_vals, width=0.65, bottom=pv_vals + bess_vals + afrr_capacity_vals, color="blue", label="aFRR Energy")
 
-            ax2.set_title("BESS Specific Monthly Revenues per MW")
+            ax2.set_title("Specific Monthly Revenues per MW")
             ax2.set_ylabel("k€/MW")
             ax2.set_xlabel("Month")
             ax2.set_xticks(x)
             ax2.set_xticklabels(monthly_df["month"], rotation=45)
             ax2.legend()
+            fig2.tight_layout()
 
             st.pyplot(fig2)
             plt.close(fig2)
 
-        c3, c4 = st.columns(2)
-
-        with c3:
+        def _plot_monthly_valued_energy():
             fig3, ax3 = plt.subplots(figsize=(8, 4.5))
 
             ax3.plot(monthly_df["month"], monthly_df["pv_direct_mwh"], label="PV direct")
@@ -4740,443 +5215,10 @@ def app():
             ax3.set_xlabel("Mois")
             ax3.legend()
             ax3.tick_params(axis="x", rotation=45)
-            st.pyplot(fig3)
-            plt.close(fig3)
+            fig3.tight_layout()
+            return fig3
 
-        with c4:
-            start_date = pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00")
-            end_date = start_date + pd.Timedelta(hours=120)
-
-            df_plot = hourly_df[
-                (hourly_df["datetime"] >= start_date) &
-                (hourly_df["datetime"] < end_date)
-            ].copy()
-
-            fig, ax1 = plt.subplots(figsize=(12, 5))
-            bar_width = 0.03
-
-            ax1.fill_between(
-                df_plot["datetime"],
-                df_plot["pv_direct_mwh"],
-                color="orange",
-                alpha=0.5,
-                label="PV → Réseau"
-            )
-            ax1.plot(
-                df_plot["datetime"],
-                df_plot["pv_direct_mwh"],
-                color="orange",
-                linewidth=1.8
-            )
-
-            ax1.bar(
-                df_plot["datetime"],
-                df_plot["battery_discharge_mwh"],
-                width=bar_width,
-                label="Batterie → Réseau (wholesale)",
-                alpha=0.8,
-                color="green"
-            )
-
-            ax1.bar(
-                df_plot["datetime"],
-                -df_plot["pv_to_battery_mwh"],
-                width=bar_width,
-                label="PV → Batterie",
-                alpha=0.6,
-                color="red"
-            )
-
-            ax1.bar(
-                df_plot["datetime"],
-                -df_plot["grid_charge_mwh"],
-                width=bar_width,
-                bottom=-df_plot["pv_to_battery_mwh"],
-                label="Réseau → Batterie",
-                alpha=0.6
-            )
-
-            if "afrr_discharge_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    df_plot["afrr_discharge_mwh"],
-                    width=bar_width,
-                    label="aFRR → Décharge",
-                    alpha=0.5,
-                    color="purple"
-                )
-
-            if "afrr_charge_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["afrr_charge_mwh"],
-                    width=bar_width,
-                    label="aFRR → Charge",
-                    alpha=0.5,
-                    color="blue"
-                )
-
-            if "pv_curtailment_candidate_mwh" in df_plot.columns:
-                ax1.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_curtailment_candidate_mwh"],
-                    linestyle="--",
-                    linewidth=1.5,
-                    label="PV curtailed"
-                )
-
-            if "pv_curtailed_to_battery_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["pv_curtailed_to_battery_mwh"],
-                    width=bar_width,
-                    label="PV curtailed → battery",
-                    alpha=0.6
-                )
-
-            if "pv_curtailed_residual_lost_mwh" in df_plot.columns:
-                ax1.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_curtailed_residual_lost_mwh"],
-                    linestyle=":",
-                    linewidth=1.8,
-                    label="PV curtailed lost"
-                )
-
-            ax1.axhline(0, linewidth=1)
-            ax1.set_ylabel("Flux énergie (MWh)")
-            ax1.set_xlabel("Heure")
-            ax1.xaxis.set_major_locator(mdates.HourLocator(interval=6))
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Hh"))
-            ax1.tick_params(axis="x", rotation=0)
-
-            ax2 = ax1.twinx()
-            ax2.plot(
-                df_plot["datetime"],
-                df_plot["pv_price_effective_eur_per_mwh"],
-                linestyle="--",
-                alpha=0.7,
-                label="Prix spot PV effectif"
-            )
-            ax2.set_ylabel("Prix (EUR/MWh)")
-
-            lines_1, labels_1 = ax1.get_legend_handles_labels()
-            lines_2, labels_2 = ax2.get_legend_handles_labels()
-            ax1.legend(
-                lines_1 + lines_2,
-                labels_1 + labels_2,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.18),
-                ncol=3,
-                frameon=False,
-            )
-            ax1.set_title("Dispatch énergétique - 5 premiers jours de juin")
-            fig.tight_layout(rect=[0, 0.12, 1, 1])
-
-            st.pyplot(fig)
-            plt.close(fig)
-
-            st.subheader("Dispatch énergétique - 5 derniers jours de mai + 5 premiers jours de juin")
-
-            start_date = pd.Timestamp(f"{DEFAULT_YEAR}-05-27 00:00:00")
-            end_date = pd.Timestamp(f"{DEFAULT_YEAR}-06-06 00:00:00")
-            
-            df_plot = hourly_df[
-                (hourly_df["datetime"] >= start_date) &
-                (hourly_df["datetime"] < end_date)
-            ].copy()
-            
-            fig, ax1 = plt.subplots(figsize=(14, 5))
-            bar_width = 0.03
-            
-            ax1.fill_between(
-                df_plot["datetime"],
-                df_plot["pv_direct_mwh"],
-                color="orange",
-                alpha=0.5,
-                label="PV → Réseau"
-            )
-            ax1.plot(
-                df_plot["datetime"],
-                df_plot["pv_direct_mwh"],
-                color="orange",
-                linewidth=1.8
-            )
-            
-            ax1.bar(
-                df_plot["datetime"],
-                df_plot["battery_discharge_mwh"],
-                width=bar_width,
-                label="Batterie → Réseau (wholesale)",
-                alpha=0.8,
-                color="green"
-            )
-            
-            ax1.bar(
-                df_plot["datetime"],
-                -df_plot["pv_to_battery_mwh"],
-                width=bar_width,
-                label="PV → Batterie",
-                alpha=0.6,
-                color="red"
-            )
-            
-            ax1.bar(
-                df_plot["datetime"],
-                -df_plot["grid_charge_mwh"],
-                width=bar_width,
-                bottom=-df_plot["pv_to_battery_mwh"],
-                label="Réseau → Batterie",
-                alpha=0.6
-            )
-            
-            if "afrr_discharge_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    df_plot["afrr_discharge_mwh"],
-                    width=bar_width,
-                    label="aFRR → Décharge",
-                    alpha=0.5,
-                    color="purple"
-                )
-            
-            if "afrr_charge_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["afrr_charge_mwh"],
-                    width=bar_width,
-                    label="aFRR → Charge",
-                    alpha=0.5,
-                    color="blue"
-                )
-            
-            if "pv_curtailment_candidate_mwh" in df_plot.columns:
-                ax1.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_curtailment_candidate_mwh"],
-                    linestyle="--",
-                    linewidth=1.5,
-                    label="PV curtailed"
-                )
-            
-            if "pv_curtailed_to_battery_mwh" in df_plot.columns:
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["pv_curtailed_to_battery_mwh"],
-                    width=bar_width,
-                    label="PV curtailed → battery",
-                    alpha=0.6
-                )
-            
-            if "pv_curtailed_residual_lost_mwh" in df_plot.columns:
-                ax1.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_curtailed_residual_lost_mwh"],
-                    linestyle=":",
-                    linewidth=1.8,
-                    label="PV curtailed lost"
-                )
-            
-            ax1.axhline(0, linewidth=1)
-            ax1.set_ylabel("Flux énergie (MWh)")
-            ax1.set_xlabel("Heure")
-            ax1.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
-            ax1.tick_params(axis="x", rotation=45)
-            
-            ax2 = ax1.twinx()
-            ax2.plot(
-                df_plot["datetime"],
-                df_plot["pv_price_effective_eur_per_mwh"],
-                linestyle="--",
-                alpha=0.7,
-                label="Prix spot PV effectif"
-            )
-            ax2.set_ylabel("Prix (EUR/MWh)")
-            
-            lines_1, labels_1 = ax1.get_legend_handles_labels()
-            lines_2, labels_2 = ax2.get_legend_handles_labels()
-            ax1.legend(
-                lines_1 + lines_2,
-                labels_1 + labels_2,
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.18),
-                ncol=3,
-                frameon=False,
-            )
-            
-            ax1.set_title("Dispatch énergétique - 5 derniers jours de mai + 5 premiers jours de juin")
-            fig.tight_layout(rect=[0, 0.12, 1, 1])
-            
-            st.pyplot(fig)
-            plt.close(fig)
-
-            # === Dispatch énergétique - mois complet de juin, par blocs de 10 jours ===
-            st.subheader("Dispatch énergétique - mois complet de juin par blocs de 10 jours")
-            
-            june_blocks = [
-                (
-                    pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00"),
-                    pd.Timestamp(f"{DEFAULT_YEAR}-06-11 00:00:00"),
-                    "1-10 juin",
-                ),
-                (
-                    pd.Timestamp(f"{DEFAULT_YEAR}-06-11 00:00:00"),
-                    pd.Timestamp(f"{DEFAULT_YEAR}-06-21 00:00:00"),
-                    "11-20 juin",
-                ),
-                (
-                    pd.Timestamp(f"{DEFAULT_YEAR}-06-21 00:00:00"),
-                    pd.Timestamp(f"{DEFAULT_YEAR}-07-01 00:00:00"),
-                    "21-30 juin",
-                ),
-            ]
-            
-            fig, axes = plt.subplots(
-                nrows=3,
-                ncols=1,
-                figsize=(16, 12),
-                sharey=True,
-            )
-            
-            bar_width = 0.03
-            legend_handles = []
-            legend_labels = []
-            
-            for ax1, (start_date, end_date, block_title) in zip(axes, june_blocks):
-                df_plot = hourly_df[
-                    (hourly_df["datetime"] >= start_date) &
-                    (hourly_df["datetime"] < end_date)
-                ].copy()
-            
-                ax1.fill_between(
-                    df_plot["datetime"],
-                    df_plot["pv_direct_mwh"],
-                    color="orange",
-                    alpha=0.5,
-                    label="PV → Réseau"
-                )
-                ax1.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_direct_mwh"],
-                    color="orange",
-                    linewidth=1.8
-                )
-            
-                ax1.bar(
-                    df_plot["datetime"],
-                    df_plot["battery_discharge_mwh"],
-                    width=bar_width,
-                    label="Batterie → Réseau (wholesale)",
-                    alpha=0.8,
-                    color="green"
-                )
-            
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["pv_to_battery_mwh"],
-                    width=bar_width,
-                    label="PV → Batterie",
-                    alpha=0.6,
-                    color="red"
-                )
-            
-                ax1.bar(
-                    df_plot["datetime"],
-                    -df_plot["grid_charge_mwh"],
-                    width=bar_width,
-                    bottom=-df_plot["pv_to_battery_mwh"],
-                    label="Réseau → Batterie",
-                    alpha=0.6
-                )
-            
-                if "afrr_discharge_mwh" in df_plot.columns:
-                    ax1.bar(
-                        df_plot["datetime"],
-                        df_plot["afrr_discharge_mwh"],
-                        width=bar_width,
-                        label="aFRR → Décharge",
-                        alpha=0.5,
-                        color="purple"
-                    )
-            
-                if "afrr_charge_mwh" in df_plot.columns:
-                    ax1.bar(
-                        df_plot["datetime"],
-                        -df_plot["afrr_charge_mwh"],
-                        width=bar_width,
-                        label="aFRR → Charge",
-                        alpha=0.5,
-                        color="blue"
-                    )
-            
-                if "pv_curtailment_candidate_mwh" in df_plot.columns:
-                    ax1.plot(
-                        df_plot["datetime"],
-                        df_plot["pv_curtailment_candidate_mwh"],
-                        linestyle="--",
-                        linewidth=1.5,
-                        label="PV curtailed"
-                    )
-            
-                if "pv_curtailed_to_battery_mwh" in df_plot.columns:
-                    ax1.bar(
-                        df_plot["datetime"],
-                        -df_plot["pv_curtailed_to_battery_mwh"],
-                        width=bar_width,
-                        label="PV curtailed → battery",
-                        alpha=0.6
-                    )
-            
-                if "pv_curtailed_residual_lost_mwh" in df_plot.columns:
-                    ax1.plot(
-                        df_plot["datetime"],
-                        df_plot["pv_curtailed_residual_lost_mwh"],
-                        linestyle=":",
-                        linewidth=1.8,
-                        label="PV curtailed lost"
-                    )
-            
-                ax1.axhline(0, linewidth=1)
-                ax1.set_ylabel("Flux énergie (MWh)")
-                ax1.set_title(f"Dispatch énergétique - {block_title}")
-                ax1.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
-                ax1.tick_params(axis="x", rotation=45)
-            
-                ax2 = ax1.twinx()
-                ax2.plot(
-                    df_plot["datetime"],
-                    df_plot["pv_price_effective_eur_per_mwh"],
-                    linestyle="--",
-                    alpha=0.7,
-                    label="Prix spot PV effectif"
-                )
-                ax2.set_ylabel("Prix (EUR/MWh)")
-            
-                if not legend_handles:
-                    lines_1, labels_1 = ax1.get_legend_handles_labels()
-                    lines_2, labels_2 = ax2.get_legend_handles_labels()
-                    legend_handles = lines_1 + lines_2
-                    legend_labels = labels_1 + labels_2
-            
-            fig.legend(
-                legend_handles,
-                legend_labels,
-                loc="lower center",
-                ncol=4,
-                frameon=False,
-            )
-            
-            fig.suptitle("Dispatch énergétique - mois complet de juin", fontsize=14)
-            fig.tight_layout(rect=[0, 0.08, 1, 0.96])
-            
-            st.pyplot(fig)
-            plt.close(fig)
-
-        c5, c6 = st.columns(2)
-
-        with c5:
+        def _plot_specific_monthly_revenues_per_mwh():
             fig5, ax5 = plt.subplots(figsize=(9, 4.8))
 
             x = np.arange(len(monthly_df))
@@ -5219,96 +5261,302 @@ def app():
             ax5.set_xticks(x)
             ax5.set_xticklabels(monthly_df["month"], rotation=45)
             ax5.legend()
+            fig5.tight_layout()
+            return fig5
 
-            st.pyplot(fig5)
-            plt.close(fig5)
+        def _plot_dispatch_period(start_date, end_date, title, figsize=(12, 5), day_locator=False):
+            df_plot = hourly_df[
+                (hourly_df["datetime"] >= start_date) &
+                (hourly_df["datetime"] < end_date)
+            ].copy()
 
-        with c6:
-            if afrr_qh_df is not None:
-                qh_debug_start = pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00")
-                qh_debug_end = qh_debug_start + pd.Timedelta(days=3)
+            fig, ax1 = plt.subplots(figsize=figsize)
+            bar_width = 0.03
 
-                qh_plot = afrr_qh_df[
-                    (afrr_qh_df["datetime"] >= qh_debug_start) &
-                    (afrr_qh_df["datetime"] < qh_debug_end)
+            ax1.fill_between(
+                df_plot["datetime"],
+                df_plot["pv_direct_mwh"],
+                color="orange",
+                alpha=0.5,
+                label="PV → Réseau"
+            )
+            ax1.plot(
+                df_plot["datetime"],
+                df_plot["pv_direct_mwh"],
+                color="orange",
+                linewidth=1.8
+            )
+
+            ax1.bar(
+                df_plot["datetime"],
+                df_plot["battery_discharge_mwh"],
+                width=bar_width,
+                label="Batterie → Réseau (wholesale)",
+                alpha=0.8,
+                color="green"
+            )
+
+            ax1.bar(
+                df_plot["datetime"],
+                -df_plot["pv_to_battery_mwh"],
+                width=bar_width,
+                label="PV → Batterie",
+                alpha=0.6,
+                color="red"
+            )
+
+            ax1.bar(
+                df_plot["datetime"],
+                -df_plot["grid_charge_mwh"],
+                width=bar_width,
+                bottom=-df_plot["pv_to_battery_mwh"],
+                label="Réseau → Batterie",
+                alpha=0.6
+            )
+
+            if "afrr_discharge_mwh" in df_plot.columns:
+                ax1.bar(
+                    df_plot["datetime"],
+                    df_plot["afrr_discharge_mwh"],
+                    width=bar_width,
+                    label="aFRR → Décharge",
+                    alpha=0.5,
+                    color="purple"
+                )
+
+            if "afrr_charge_mwh" in df_plot.columns:
+                ax1.bar(
+                    df_plot["datetime"],
+                    -df_plot["afrr_charge_mwh"],
+                    width=bar_width,
+                    label="aFRR → Charge",
+                    alpha=0.5,
+                    color="blue"
+                )
+
+            if "pv_curtailment_candidate_mwh" in df_plot.columns:
+                ax1.plot(
+                    df_plot["datetime"],
+                    df_plot["pv_curtailment_candidate_mwh"],
+                    linestyle="--",
+                    linewidth=1.5,
+                    label="PV curtailed"
+                )
+
+            if "pv_curtailed_to_battery_mwh" in df_plot.columns:
+                ax1.bar(
+                    df_plot["datetime"],
+                    -df_plot["pv_curtailed_to_battery_mwh"],
+                    width=bar_width,
+                    label="PV curtailed → battery",
+                    alpha=0.6
+                )
+
+            if "pv_curtailed_residual_lost_mwh" in df_plot.columns:
+                ax1.plot(
+                    df_plot["datetime"],
+                    df_plot["pv_curtailed_residual_lost_mwh"],
+                    linestyle=":",
+                    linewidth=1.8,
+                    label="PV curtailed lost"
+                )
+
+            ax1.axhline(0, linewidth=1)
+            ax1.set_ylabel("Flux énergie (MWh)")
+            ax1.set_xlabel("Heure")
+            if day_locator:
+                ax1.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+                ax1.tick_params(axis="x", rotation=45)
+            else:
+                ax1.xaxis.set_major_locator(mdates.HourLocator(interval=12))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %Hh"))
+                ax1.tick_params(axis="x", rotation=45)
+
+            ax2 = ax1.twinx()
+            ax2.plot(
+                df_plot["datetime"],
+                df_plot["pv_price_effective_eur_per_mwh"],
+                linestyle="--",
+                alpha=0.7,
+                label="Prix spot PV effectif"
+            )
+            ax2.set_ylabel("Prix (EUR/MWh)")
+
+            lines_1, labels_1 = ax1.get_legend_handles_labels()
+            lines_2, labels_2 = ax2.get_legend_handles_labels()
+            ax1.legend(
+                lines_1 + lines_2,
+                labels_1 + labels_2,
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.18),
+                ncol=3,
+                frameon=False,
+            )
+            ax1.set_title(title)
+            fig.tight_layout(rect=[0, 0.12, 1, 1])
+            return fig
+
+        def _plot_full_june_dispatch():
+            june_blocks = [
+                (
+                    pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00"),
+                    pd.Timestamp(f"{DEFAULT_YEAR}-06-11 00:00:00"),
+                    "1-10 juin",
+                ),
+                (
+                    pd.Timestamp(f"{DEFAULT_YEAR}-06-11 00:00:00"),
+                    pd.Timestamp(f"{DEFAULT_YEAR}-06-21 00:00:00"),
+                    "11-20 juin",
+                ),
+                (
+                    pd.Timestamp(f"{DEFAULT_YEAR}-06-21 00:00:00"),
+                    pd.Timestamp(f"{DEFAULT_YEAR}-07-01 00:00:00"),
+                    "21-30 juin",
+                ),
+            ]
+
+            fig, axes = plt.subplots(
+                nrows=3,
+                ncols=1,
+                figsize=(16, 12),
+                sharey=True,
+            )
+
+            bar_width = 0.03
+            legend_handles = []
+            legend_labels = []
+
+            for ax1, (start_date, end_date, block_title) in zip(axes, june_blocks):
+                df_plot = hourly_df[
+                    (hourly_df["datetime"] >= start_date) &
+                    (hourly_df["datetime"] < end_date)
                 ].copy()
 
-                fig6, ax6 = plt.subplots(figsize=(12, 4.8))
-                ax6.bar(qh_plot["datetime"], qh_plot["afrr_discharge_mwh"], width=0.008, label="Décharge aFRR", alpha=0.7)
-                ax6.bar(qh_plot["datetime"], qh_plot["wholesale_discharge_mwh"], width=0.008, label="Décharge wholesale", alpha=0.7)
-                ax6.bar(qh_plot["datetime"], -qh_plot["afrr_charge_mwh"], width=0.008, label="Charge aFRR", alpha=0.7)
-                ax6.set_ylabel("MWh / 15 min")
-                ax6.set_title("Arbitrage quart-horaire - 3 premiers jours de juin")
-                ax6.xaxis.set_major_locator(mdates.HourLocator(interval=6))
-                ax6.xaxis.set_major_formatter(mdates.DateFormatter("%d %Hh"))
-                ax6.tick_params(axis="x", rotation=45)
-
-                ax6b = ax6.twinx()
-                ax6b.plot(qh_plot["datetime"], qh_plot["afrr_charge_price_effective_eur_per_mwh"], linestyle="--", alpha=0.7, label="Prix charge aFRR effectif")
-                ax6b.plot(qh_plot["datetime"], qh_plot["afrr_discharge_price_effective_eur_per_mwh"], linestyle="-.", alpha=0.7, label="Prix décharge aFRR effectif")
-                ax6b.set_ylabel("EUR/MWh")
-
-                lines_a, labels_a = ax6.get_legend_handles_labels()
-                lines_b, labels_b = ax6b.get_legend_handles_labels()
-                ax6.legend(lines_a + lines_b, labels_a + labels_b, loc="upper right")
-
-                st.pyplot(fig6)
-                plt.close(fig6)
-            else:
-                st.info("Activez l'aFRR et uploadez les deux fichiers quart-horaires pour afficher le graphique aFRR.")
-
-        c7, c8 = st.columns(2)
-
-        with c7:
-            st.subheader("Comparaison Revenu PV-only vs Hybrid")
-
-            fig_cmp, ax_cmp = plt.subplots(figsize=(9, 4.8))
-
-            x = np.arange(len(monthly_df))
-
-            pv_only_monthly_keur = monthly_df["pv_only_revenue"].to_numpy(dtype=float) / 1000.0
-            hybrid_monthly_keur = monthly_df["net_revenue"].to_numpy(dtype=float) / 1000.0
-            
-            ax_cmp.plot(
-                x,
-                pv_only_monthly_keur,
-                marker="o",
-                linewidth=2.0,
-                label="PV-only"
-            )
-            
-            ax_cmp.plot(
-                x,
-                hybrid_monthly_keur,
-                marker="o",
-                linewidth=2.0,
-                label="Hybrid (PV + BESS)"
-            )
-            
-            if enable_cfd and "pv_only_cfd_revenue" in monthly_df.columns:
-                pv_only_cfd_monthly_keur = (
-                    monthly_df["pv_only_cfd_revenue"].to_numpy(dtype=float) / 1000.0
+                ax1.fill_between(
+                    df_plot["datetime"],
+                    df_plot["pv_direct_mwh"],
+                    color="orange",
+                    alpha=0.5,
+                    label="PV → Réseau"
                 )
-            
-                ax_cmp.plot(
-                    x,
-                    pv_only_cfd_monthly_keur,
-                    marker="o",
-                    linewidth=2.0,
-                    label="PV-only-CfD"
+                ax1.plot(
+                    df_plot["datetime"],
+                    df_plot["pv_direct_mwh"],
+                    color="orange",
+                    linewidth=1.8
                 )
 
-            ax_cmp.set_title("Comparaison Revenu PV-only vs Hybrid")
-            ax_cmp.set_ylabel("kEUR")
-            ax_cmp.set_xlabel("Mois")
-            ax_cmp.set_xticks(x)
-            ax_cmp.set_xticklabels(monthly_df["month"], rotation=45)
-            ax_cmp.legend()
+                ax1.bar(
+                    df_plot["datetime"],
+                    df_plot["battery_discharge_mwh"],
+                    width=bar_width,
+                    label="Batterie → Réseau (wholesale)",
+                    alpha=0.8,
+                    color="green"
+                )
 
-            st.pyplot(fig_cmp)
-            plt.close(fig_cmp)
+                ax1.bar(
+                    df_plot["datetime"],
+                    -df_plot["pv_to_battery_mwh"],
+                    width=bar_width,
+                    label="PV → Batterie",
+                    alpha=0.6,
+                    color="red"
+                )
 
-        with c8:
+                ax1.bar(
+                    df_plot["datetime"],
+                    -df_plot["grid_charge_mwh"],
+                    width=bar_width,
+                    bottom=-df_plot["pv_to_battery_mwh"],
+                    label="Réseau → Batterie",
+                    alpha=0.6
+                )
+
+                if "afrr_discharge_mwh" in df_plot.columns:
+                    ax1.bar(
+                        df_plot["datetime"],
+                        df_plot["afrr_discharge_mwh"],
+                        width=bar_width,
+                        label="aFRR → Décharge",
+                        alpha=0.5,
+                        color="purple"
+                    )
+
+                if "afrr_charge_mwh" in df_plot.columns:
+                    ax1.bar(
+                        df_plot["datetime"],
+                        -df_plot["afrr_charge_mwh"],
+                        width=bar_width,
+                        label="aFRR → Charge",
+                        alpha=0.5,
+                        color="blue"
+                    )
+
+                if "pv_curtailment_candidate_mwh" in df_plot.columns:
+                    ax1.plot(
+                        df_plot["datetime"],
+                        df_plot["pv_curtailment_candidate_mwh"],
+                        linestyle="--",
+                        linewidth=1.5,
+                        label="PV curtailed"
+                    )
+
+                if "pv_curtailed_to_battery_mwh" in df_plot.columns:
+                    ax1.bar(
+                        df_plot["datetime"],
+                        -df_plot["pv_curtailed_to_battery_mwh"],
+                        width=bar_width,
+                        label="PV curtailed → battery",
+                        alpha=0.6
+                    )
+
+                if "pv_curtailed_residual_lost_mwh" in df_plot.columns:
+                    ax1.plot(
+                        df_plot["datetime"],
+                        df_plot["pv_curtailed_residual_lost_mwh"],
+                        linestyle=":",
+                        linewidth=1.8,
+                        label="PV curtailed lost"
+                    )
+
+                ax1.axhline(0, linewidth=1)
+                ax1.set_ylabel("Flux énergie (MWh)")
+                ax1.set_title(f"Dispatch énergétique - {block_title}")
+                ax1.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+                ax1.tick_params(axis="x", rotation=45)
+
+                ax2 = ax1.twinx()
+                ax2.plot(
+                    df_plot["datetime"],
+                    df_plot["pv_price_effective_eur_per_mwh"],
+                    linestyle="--",
+                    alpha=0.7,
+                    label="Prix spot PV effectif"
+                )
+                ax2.set_ylabel("Prix (EUR/MWh)")
+
+                if not legend_handles:
+                    lines_1, labels_1 = ax1.get_legend_handles_labels()
+                    lines_2, labels_2 = ax2.get_legend_handles_labels()
+                    legend_handles = lines_1 + lines_2
+                    legend_labels = labels_1 + labels_2
+
+            fig.legend(
+                legend_handles,
+                legend_labels,
+                loc="lower center",
+                ncol=4,
+                frameon=False,
+            )
+
+            fig.suptitle("Dispatch énergétique - mois complet de juin", fontsize=14)
+            fig.tight_layout(rect=[0, 0.08, 1, 0.96])
+            return fig
+
+        def _plot_curtailment_monthly():
             fig8, ax8 = plt.subplots(figsize=(9, 4.8))
 
             x = np.arange(len(monthly_df))
@@ -5344,7 +5592,108 @@ def app():
             ax8.set_xticks(x)
             ax8.set_xticklabels(monthly_df["month"], rotation=45)
             ax8.legend()
+            fig8.tight_layout()
+            return fig8
 
+        c3, c4 = st.columns(2)
+        with c3:
+            fig3 = _plot_monthly_valued_energy()
+            st.pyplot(fig3)
+            plt.close(fig3)
+        with c4:
+            fig5 = _plot_specific_monthly_revenues_per_mwh()
+            st.pyplot(fig5)
+            plt.close(fig5)
+
+        st.subheader("Dispatch énergétique")
+
+        # Layout requested by the user:
+        # - Left side: the two short-period dispatch charts stacked vertically,
+        #   each on its own row.
+        # - Right side: the full-June dispatch chart spanning the same overall
+        #   vertical space as the two left charts combined.
+        dispatch_left_col, dispatch_right_col = st.columns([1, 1])
+
+        with dispatch_left_col:
+            fig = _plot_dispatch_period(
+                pd.Timestamp(f"{DEFAULT_YEAR}-06-01 00:00:00"),
+                pd.Timestamp(f"{DEFAULT_YEAR}-06-06 00:00:00"),
+                "Dispatch énergétique - 5 premiers jours de juin",
+                figsize=(12, 5.8),
+                day_locator=False,
+            )
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+            fig = _plot_dispatch_period(
+                pd.Timestamp(f"{DEFAULT_YEAR}-05-27 00:00:00"),
+                pd.Timestamp(f"{DEFAULT_YEAR}-06-06 00:00:00"),
+                "Dispatch énergétique - 5 derniers jours de mai + 5 premiers jours de juin",
+                figsize=(12, 5.8),
+                day_locator=True,
+            )
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+        with dispatch_right_col:
+            fig = _plot_full_june_dispatch()
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+
+        c7, c8 = st.columns(2)
+        with c7:
+            st.subheader("Comparaison Revenu PV-only vs Hybrid")
+
+            fig_cmp, ax_cmp = plt.subplots(figsize=(9, 4.8))
+
+            x = np.arange(len(monthly_df))
+
+            pv_only_monthly_keur = monthly_df["pv_only_revenue"].to_numpy(dtype=float) / 1000.0
+            hybrid_monthly_keur = monthly_df["net_revenue"].to_numpy(dtype=float) / 1000.0
+
+            ax_cmp.plot(
+                x,
+                pv_only_monthly_keur,
+                marker="o",
+                linewidth=2.0,
+                label="PV-only"
+            )
+
+            ax_cmp.plot(
+                x,
+                hybrid_monthly_keur,
+                marker="o",
+                linewidth=2.0,
+                label="Hybrid (PV + BESS)"
+            )
+
+            if enable_cfd and "pv_only_cfd_revenue" in monthly_df.columns:
+                pv_only_cfd_monthly_keur = (
+                    monthly_df["pv_only_cfd_revenue"].to_numpy(dtype=float) / 1000.0
+                )
+
+                ax_cmp.plot(
+                    x,
+                    pv_only_cfd_monthly_keur,
+                    marker="o",
+                    linewidth=2.0,
+                    label="PV-only-CfD"
+                )
+
+            ax_cmp.set_title("Comparaison Revenu PV-only vs Hybrid")
+            ax_cmp.set_ylabel("kEUR")
+            ax_cmp.set_xlabel("Mois")
+            ax_cmp.set_xticks(x)
+            ax_cmp.set_xticklabels(monthly_df["month"], rotation=45)
+            ax_cmp.legend()
+            fig_cmp.tight_layout()
+
+            st.pyplot(fig_cmp)
+            plt.close(fig_cmp)
+
+        with c8:
+            st.subheader("Curtailment Specifics")
+            fig8 = _plot_curtailment_monthly()
             st.pyplot(fig8)
             plt.close(fig8)
 
